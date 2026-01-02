@@ -113,7 +113,7 @@ export function createPermission(type: PermissionType, pattern: string): Permiss
  */
 export function addPermission(permissions: Permission[], type: PermissionType, pattern: string): Permission[] {
   const permission = createPermission(type, pattern);
-  return [...permissions, permission];
+  return sortPermissions([...permissions, permission]);
 }
 
 /**
@@ -356,7 +356,7 @@ export function hasRootAccess(permissions: Permission[]): boolean {
  * ```
  */
 export function createPermissions(rules: Array<[PermissionType, string]>): Permission[] {
-  return rules.map(([type, pattern]) => createPermission(type, pattern));
+  return sortPermissions(rules.map(([type, pattern]) => createPermission(type, pattern)));
 }
 
 /**
@@ -427,4 +427,320 @@ export function mergePermissions(...permissionArrays: Permission[][]): Permissio
  */
 export function filterPermissionsByType(permissions: Permission[], type: PermissionType): Permission[] {
   return permissions.filter((p) => p.type === type);
+}
+
+/**
+ * Validate a permission pattern without creating a Permission object.
+ *
+ * Useful for form validation, input sanitization, or pre-flight checks.
+ * This function checks the pattern's structure without throwing exceptions.
+ *
+ * @param {unknown} pattern - Permission pattern to validate
+ * @returns {{valid: boolean, error?: string}} Validation result with optional error message
+ *
+ * @example
+ * ```ts
+ * import { validatePermissionPattern } from "@fimbul-works/acl";
+ *
+ * validatePermissionPattern("user.*.read"); // {valid: true}
+ * validatePermissionPattern("*"); // {valid: true}
+ * validatePermissionPattern(""); // {valid: false, error: "Permission pattern cannot be empty"}
+ * validatePermissionPattern("   "); // {valid: false, error: "Permission pattern cannot be empty"}
+ * validatePermissionPattern(null as any); // {valid: false, error: "Permission pattern must be a non-empty string"}
+ * ```
+ */
+export function validatePermissionPattern(pattern: unknown): { valid: boolean; error?: string } {
+  if (typeof pattern !== "string" || pattern === null || pattern === undefined) {
+    return { valid: false, error: "Permission pattern must be a non-empty string" };
+  }
+
+  const normalizedPattern = (pattern as string).trim();
+  if (normalizedPattern.length === 0) {
+    return { valid: false, error: "Permission pattern cannot be empty" };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Serialize permissions to a compact string format.
+ *
+ * Converts an array of Permission objects to a string suitable for storage,
+ * transmission, or embedding in tokens (e.g., JWTs). The format is:
+ * `"type1:pattern1,type2:pattern2,..."`
+ *
+ * @param {Permission[]} permissions - Array of Permission objects to serialize
+ * @returns {string} Serialized permissions string
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, serializePermissions } from "@fimbul-works/acl";
+ *
+ * const permissions = createPermissions([
+ *   ["allow", "user.*.read"],
+ *   ["deny", "admin.*"],
+ * ]);
+ *
+ * const serialized = serializePermissions(permissions);
+ * // "allow:user.*.read,deny:admin.*"
+ * ```
+ */
+export function serializePermissions(permissions: Permission[]): string {
+  return permissions.map((p) => `${p.type}:${p.pattern}`).join(",");
+}
+
+/**
+ * Deserialize permissions from a string format.
+ *
+ * Parses a serialized permissions string back into an array of Permission objects.
+ * Invalid entries are silently skipped to ensure graceful degradation.
+ *
+ * @param {string} data - Serialized permissions string (format: `"type:pattern,type:pattern,..."`)
+ * @returns {Permission[]} Array of Permission objects
+ *
+ * @example
+ * ```ts
+ * import { deserializePermissions } from "@fimbul-works/acl";
+ *
+ * const data = "allow:user.*.read,deny:admin.*,allow:*.public.view";
+ * const permissions = deserializePermissions(data);
+ * // Returns array of 3 Permission objects
+ * ```
+ */
+export function deserializePermissions(data: string): Permission[] {
+  if (!data || data.trim().length === 0) {
+    return [];
+  }
+
+  return data
+    .split(",")
+    .map((entry) => {
+      const trimmed = entry.trim();
+      if (!trimmed) return null;
+
+      const colonIndex = trimmed.indexOf(":");
+      if (colonIndex === -1) return null;
+
+      const type = trimmed.slice(0, colonIndex) as PermissionType;
+      const pattern = trimmed.slice(colonIndex + 1);
+
+      // Validate and create permission, skip invalid entries
+      try {
+        return createPermission(type, pattern);
+      } catch {
+        return null;
+      }
+    })
+    .filter((p): p is Permission => p !== null);
+}
+
+/**
+ * Check multiple resources at once.
+ *
+ * More efficient than calling `checkPermission` multiple times, as it processes
+ * all resources in a single pass through the permissions array.
+ *
+ * @param {Permission[]} permissions - Array of Permission objects
+ * @param {string[]} resources - Array of resource strings to check
+ * @returns {boolean[]} Array of boolean results corresponding to each resource
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, checkPermissions } from "@fimbul-works/acl";
+ *
+ * const permissions = createPermissions([
+ *   ["allow", "user.*.read"],
+ *   ["deny", "admin.*"],
+ * ]);
+ *
+ * const results = checkPermissions(permissions, [
+ *   "user.1234.read",
+ *   "admin.panel",
+ *   "user.5678.read",
+ * ]);
+ * // [true, false, true]
+ * ```
+ */
+export function checkPermissions(permissions: Permission[], resources: string[]): boolean[] {
+  return resources.map((resource) => checkPermission(permissions, resource));
+}
+
+/**
+ * Sort permissions by precedence for optimized checking.
+ *
+ * Sorts permissions in the optimal order for permission evaluation:
+ * 1. Deny permissions before allow (deny takes precedence)
+ * 2. Root (`*`) before wildcards before specific patterns (general to specific)
+ * 3. Wildcards (`*`) before specific patterns (broader matches first)
+ *
+ * This sorting can improve performance when checking permissions, as more
+ * general/important rules are evaluated first.
+ *
+ * @param {Permission[]} permissions - Array of Permission objects to sort
+ * @returns {Permission[]} New array with permissions sorted by precedence
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, sortPermissions } from "@fimbul-works/acl";
+ *
+ * const permissions = createPermissions([
+ *   ["allow", "user.1234.read"],
+ *   ["deny", "*"],
+ *   ["allow", "*.public"],
+ *   ["deny", "admin.*"],
+ * ]);
+ *
+ * const sorted = sortPermissions(permissions);
+ * // Order: deny:*, deny:admin.*, allow:*.public, allow:user.1234.read
+ * ```
+ */
+export function sortPermissions(permissions: Permission[]): Permission[] {
+  return [...permissions].sort((a, b) => {
+    // Deny comes before allow
+    if (a.type !== b.type) {
+      return a.type === "deny" ? -1 : 1;
+    }
+
+    // Calculate specificity score (lower = more general)
+    const getSpecificity = (perm: Permission): number => {
+      if (perm.isRoot) return 0; // Most general
+      const wildcardCount = perm.parts.filter((p) => p === "*").length;
+      return wildcardCount === 0 ? 2 : 1; // Specific vs wildcard
+    };
+
+    const aSpecificity = getSpecificity(a);
+    const bSpecificity = getSpecificity(b);
+
+    if (aSpecificity !== bSpecificity) {
+      return aSpecificity - bSpecificity; // More general first
+    }
+
+    // Same specificity, sort by pattern for consistency
+    return a.pattern.localeCompare(b.pattern);
+  });
+}
+
+/**
+ * Intersect multiple permission arrays.
+ *
+ * Returns permissions that exist in ALL provided arrays.
+ * Permissions are considered equal if they have the same type and pattern.
+ * This is useful for finding common permissions across multiple roles or groups.
+ *
+ * @param {Permission[][]} permissionArrays - Variable number of permission arrays to intersect
+ * @returns {Permission[]} Array of permissions common to all input arrays
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, intersectPermissions } from "@fimbul-works/acl";
+ *
+ * const editors = createPermissions([
+ *   ["allow", "content.*.edit"],
+ *   ["allow", "content.*.read"],
+ *   ["deny", "content.*.delete"],
+ * ]);
+ *
+ * const reviewers = createPermissions([
+ *   ["allow", "content.*.read"],
+ *   ["allow", "content.*.publish"],
+ * ]);
+ *
+ * const common = intersectPermissions(editors, reviewers);
+ * // ["allow", "content.*.read"] - only the common permission
+ * ```
+ */
+export function intersectPermissions(...permissionArrays: Permission[][]): Permission[] {
+  if (permissionArrays.length === 0) return [];
+  if (permissionArrays.length === 1) return permissionArrays[0];
+
+  const [first, ...rest] = permissionArrays;
+
+  return first.filter((perm) =>
+    rest.every((arr) => arr.some((p) => p.type === perm.type && p.pattern === perm.pattern)),
+  );
+}
+
+/**
+ * Subtract one set of permissions from another.
+ *
+ * Returns permissions from `base` that do not exist in `remove`.
+ * A permission is removed if it has the same type AND pattern.
+ * This is useful for calculating permission differences between roles.
+ *
+ * @param {Permission[]} base - Base permission array
+ * @param {Permission[]} remove - Permissions to remove from base
+ * @returns {Permission[]} Permissions in base but not in remove
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, subtractPermissions } from "@fimbul-works/acl";
+ *
+ * const admins = createPermissions([
+ *   ["allow", "*"],
+ *   ["deny", "system.*"],
+ * ]);
+ *
+ * const users = createPermissions([
+ *   ["allow", "user.*.read"],
+ * ]);
+ *
+ * const diff = subtractPermissions(admins, users);
+ * // Returns admin permissions minus user permissions
+ * // ["allow:*", "deny:system.*"]
+ * ```
+ */
+export function subtractPermissions(base: Permission[], remove: Permission[]): Permission[] {
+  const removeSet = new Set(remove.map((p) => `${p.type}:${p.pattern}`));
+  return base.filter((p) => !removeSet.has(`${p.type}:${p.pattern}`));
+}
+
+/**
+ * Expand wildcard permissions against a list of actual resources.
+ *
+ * Shows which specific resources each wildcard permission would match.
+ * Useful for debugging, auditing, or visualizing permissions in admin panels.
+ *
+ * @param {Permission[]} permissions - Array of Permission objects to expand
+ * @param {string[]} resources - Array of resource strings to test against
+ * @returns {Array<{permission: Permission, matches: string[]}>} Array showing which resources each permission matches
+ *
+ * @example
+ * ```ts
+ * import { createPermissions, expandPermissions } from "@fimbul-works/acl";
+ *
+ * const permissions = createPermissions([
+ *   ["allow", "user.*.read"],
+ *   ["deny", "admin.*"],
+ * ]);
+ *
+ * const resources = [
+ *   "user.1234.read",
+ *   "user.5678.edit",
+ *   "admin.panel",
+ *   "discussion.123.read",
+ * ];
+ *
+ * const expanded = expandPermissions(permissions, resources);
+ * // [
+ * //   { permission: {type: "allow", pattern: "user.*.read", ...}, matches: ["user.1234.read"] },
+ * //   { permission: {type: "deny", pattern: "admin.*", ...}, matches: ["admin.panel"] }
+ * // ]
+ * ```
+ */
+export function expandPermissions(
+  permissions: Permission[],
+  resources: string[],
+): Array<{ permission: Permission; matches: string[] }> {
+  return permissions.map((permission) => ({
+    permission,
+    matches: resources.filter((resource) => {
+      // Check if the resource pattern matches this permission's pattern
+      // We use getMatchingPermissions internally which checks pattern matching
+      const normalizedResource = resource.trim();
+      if (normalizedResource.length === 0) return false;
+
+      const resourceParts = normalizedResource.split(".");
+      return permission.isRoot || matchesPattern(resourceParts, permission.parts);
+    }),
+  }));
 }

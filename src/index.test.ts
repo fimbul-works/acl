@@ -4,13 +4,21 @@ import {
   type PermissionType,
   addPermission,
   checkPermission,
+  checkPermissions,
   createPermission,
   createPermissions,
+  deserializePermissions,
+  expandPermissions,
   filterPermissionsByType,
   getMatchingPermissions,
   hasRootAccess,
+  intersectPermissions,
   mergePermissions,
   removePermission,
+  serializePermissions,
+  sortPermissions,
+  subtractPermissions,
+  validatePermissionPattern,
 } from "./index.js";
 
 // Utility functions for common ACL patterns
@@ -99,7 +107,7 @@ describe("Permission Creation and Management", () => {
       const newPermissions = addPermission(permissions, "deny", "admin.*");
 
       expect(newPermissions).toHaveLength(2);
-      expect(newPermissions[1]!.pattern).toBe("admin.*");
+      expect(newPermissions[0]!.pattern).toBe("admin.*");
     });
   });
 
@@ -130,8 +138,8 @@ describe("Permission Creation and Management", () => {
       ]);
 
       expect(permissions).toHaveLength(3);
-      expect(permissions[0]!.type).toBe("allow");
-      expect(permissions[1]!.type).toBe("deny");
+      expect(permissions[0]!.type).toBe("deny");
+      expect(permissions[1]!.type).toBe("allow");
       expect(permissions[2]!.pattern).toBe("user.1234.edit");
     });
   });
@@ -515,5 +523,354 @@ describe("Integration Tests", () => {
 
     const duration = Date.now() - start;
     expect(duration).toBeLessThan(100); // Should complete in reasonable time
+  });
+});
+
+describe("Serialization", () => {
+  describe("serializePermissions", () => {
+    it("should serialize permissions to string", () => {
+      const permissions = createPermissions([
+        ["allow", "user.*.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const serialized = serializePermissions(permissions);
+      expect(serialized).toBe("deny:admin.*,allow:user.*.read");
+    });
+
+    it("should handle empty array", () => {
+      expect(serializePermissions([])).toBe("");
+    });
+
+    it("should handle single permission", () => {
+      const permissions = createPermissions([["allow", "*"]]);
+      expect(serializePermissions(permissions)).toBe("allow:*");
+    });
+  });
+
+  describe("deserializePermissions", () => {
+    it("should deserialize string to permissions", () => {
+      const data = "allow:user.*.read,deny:admin.*";
+      const permissions = deserializePermissions(data);
+
+      expect(permissions).toHaveLength(2);
+      expect(permissions[0]!.type).toBe("allow");
+      expect(permissions[0]!.pattern).toBe("user.*.read");
+      expect(permissions[1]!.type).toBe("deny");
+      expect(permissions[1]!.pattern).toBe("admin.*");
+    });
+
+    it("should handle empty string", () => {
+      expect(deserializePermissions("")).toEqual([]);
+      expect(deserializePermissions("   ")).toEqual([]);
+    });
+
+    it("should skip invalid entries gracefully", () => {
+      const data = "allow:user.*,invalid-entry,deny:admin.*,badtype:*.read,,deny:*.write";
+      const permissions = deserializePermissions(data);
+
+      expect(permissions).toHaveLength(3); // Only valid entries
+      expect(permissions[0]!.pattern).toBe("user.*");
+      expect(permissions[1]!.pattern).toBe("admin.*");
+      expect(permissions[2]!.pattern).toBe("*.write");
+    });
+
+    it("should handle round-trip serialization", () => {
+      const original = createPermissions([
+        ["allow", "user.*.read"],
+        ["deny", "admin.*"],
+        ["allow", "*.public.view"],
+      ]);
+
+      const serialized = serializePermissions(original);
+      const deserialized = deserializePermissions(serialized);
+
+      expect(deserialized).toHaveLength(original.length);
+      expect(deserialized.map((p) => p.pattern)).toEqual(original.map((p) => p.pattern));
+      expect(deserialized.map((p) => p.type)).toEqual(original.map((p) => p.type));
+    });
+  });
+});
+
+describe("Batch Operations", () => {
+  describe("checkPermissions", () => {
+    it("should check multiple resources at once", () => {
+      const permissions = createPermissions([
+        ["allow", "user.*.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const results = checkPermissions(permissions, [
+        "user.1234.read",
+        "admin.panel",
+        "user.5678.read",
+        "discussion.read",
+      ]);
+
+      expect(results).toEqual([true, false, true, false]);
+    });
+
+    it("should return empty array for no resources", () => {
+      const permissions = createPermissions([["allow", "*"]]);
+      expect(checkPermissions(permissions, [])).toEqual([]);
+    });
+
+    it("should handle invalid resources", () => {
+      const permissions = createPermissions([["allow", "*"]]);
+      const results = checkPermissions(permissions, ["user.read", "", "admin.panel"]);
+
+      expect(results).toEqual([true, false, true]);
+    });
+  });
+});
+
+describe("Permission Sorting", () => {
+  describe("sortPermissions", () => {
+    it("should sort deny before allow", () => {
+      const permissions = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const sorted = sortPermissions(permissions);
+
+      expect(sorted[0]!.type).toBe("deny");
+      expect(sorted[1]!.type).toBe("allow");
+    });
+
+    it("should sort root before wildcards before specific", () => {
+      const permissions = createPermissions([
+        ["allow", "user.1234.read"],
+        ["deny", "*"],
+        ["allow", "*.public"],
+      ]);
+
+      const sorted = sortPermissions(permissions);
+
+      expect(sorted[0]!.isRoot).toBe(true);
+      expect(sorted[0]!.pattern).toBe("*");
+      expect(sorted[1]!.pattern).toBe("*.public");
+      expect(sorted[2]!.pattern).toBe("user.1234.read");
+    });
+
+    it("should sort by pattern for same specificity", () => {
+      const permissions = createPermissions([
+        ["allow", "user.read"],
+        ["allow", "admin.read"],
+        ["allow", "*.public"],
+      ]);
+
+      const sorted = sortPermissions(permissions);
+
+      // Wildcard first, then alphabetically
+      expect(sorted[0]!.pattern).toBe("*.public");
+      expect(sorted[1]!.pattern).toBe("admin.read");
+      expect(sorted[2]!.pattern).toBe("user.read");
+    });
+
+    it("should not mutate original array", () => {
+      const permissions = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const originalOrder = permissions.map((p) => p.pattern);
+      sortPermissions(permissions);
+
+      expect(permissions.map((p) => p.pattern)).toEqual(originalOrder);
+    });
+  });
+});
+
+describe("Permission Math", () => {
+  describe("intersectPermissions", () => {
+    it("should find common permissions between two arrays", () => {
+      const editors = createPermissions([
+        ["allow", "content.*.edit"],
+        ["allow", "content.*.read"],
+        ["deny", "content.*.delete"],
+      ]);
+
+      const reviewers = createPermissions([
+        ["allow", "content.*.read"],
+        ["allow", "content.*.publish"],
+      ]);
+
+      const common = intersectPermissions(editors, reviewers);
+
+      expect(common).toHaveLength(1);
+      expect(common[0]!.pattern).toBe("content.*.read");
+      expect(common[0]!.type).toBe("allow");
+    });
+
+    it("should handle empty arrays", () => {
+      const perms = createPermissions([["allow", "user.read"]]);
+      expect(intersectPermissions(perms, [])).toEqual([]);
+      expect(intersectPermissions([])).toEqual([]);
+    });
+
+    it("should handle multiple arrays", () => {
+      const arr1 = createPermissions([
+        ["allow", "user.read"],
+        ["allow", "admin.read"],
+      ]);
+      const arr2 = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.write"],
+      ]);
+      const arr3 = createPermissions([["allow", "user.read"]]);
+
+      const common = intersectPermissions(arr1, arr2, arr3);
+
+      expect(common).toHaveLength(1);
+      expect(common[0]!.pattern).toBe("user.read");
+    });
+
+    it("should require both type and pattern to match", () => {
+      const arr1 = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "user.read"],
+      ]);
+      const arr2 = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.read"],
+      ]);
+
+      const common = intersectPermissions(arr1, arr2);
+
+      expect(common).toHaveLength(1);
+      expect(common[0]!.type).toBe("allow");
+    });
+  });
+
+  describe("subtractPermissions", () => {
+    it("should remove permissions that exist in both arrays", () => {
+      const base = createPermissions([
+        ["allow", "*"],
+        ["deny", "system.*"],
+        ["allow", "user.read"],
+      ]);
+
+      const remove = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const result = subtractPermissions(base, remove);
+
+      expect(result).toHaveLength(2);
+      expect(result.map((p) => p.pattern)).not.toContain("user.read");
+      expect(result.map((p) => p.pattern)).toContain("*");
+      expect(result.map((p) => p.pattern)).toContain("system.*");
+    });
+
+    it("should return unchanged array if nothing to remove", () => {
+      const base = createPermissions([["allow", "user.read"]]);
+      const remove = createPermissions([["deny", "admin.*"]]);
+
+      const result = subtractPermissions(base, remove);
+
+      expect(result).toHaveLength(1);
+      expect(result[0]!.pattern).toBe("user.read");
+    });
+
+    it("should return empty array if all removed", () => {
+      const base = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.*"],
+      ]);
+      const remove = createPermissions([
+        ["allow", "user.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const result = subtractPermissions(base, remove);
+
+      expect(result).toHaveLength(0);
+    });
+  });
+});
+
+describe("Permission Expansion", () => {
+  describe("expandPermissions", () => {
+    it("should show which resources each permission matches", () => {
+      const permissions = createPermissions([
+        ["allow", "user.*.read"],
+        ["deny", "admin.*"],
+      ]);
+
+      const resources = [
+        "user.1234.read",
+        "user.5678.edit",
+        "admin.users",
+        "admin.settings.edit",
+        "discussion.123.read",
+      ];
+
+      const expanded = expandPermissions(permissions, resources);
+
+      expect(expanded).toHaveLength(2);
+      expect(expanded[0]!.permission.pattern).toBe("admin.*");
+      expect(expanded[0]!.matches).toEqual(["admin.users", "admin.settings.edit"]);
+      expect(expanded[1]!.permission.pattern).toBe("user.*.read");
+      expect(expanded[1]!.matches).toEqual(["user.1234.read"]);
+    });
+
+    it("should return empty matches for non-matching permissions", () => {
+      const permissions = createPermissions([["allow", "user.*"]]);
+      const resources = ["admin.panel", "discussion.read"];
+
+      const expanded = expandPermissions(permissions, resources);
+
+      expect(expanded).toHaveLength(1);
+      expect(expanded[0]!.matches).toEqual([]);
+    });
+
+    it("should handle empty resource list", () => {
+      const permissions = createPermissions([["allow", "user.*"]]);
+      const expanded = expandPermissions(permissions, []);
+
+      expect(expanded).toHaveLength(1);
+      expect(expanded[0]!.matches).toEqual([]);
+    });
+  });
+});
+
+describe("Pattern Validation", () => {
+  describe("validatePermissionPattern", () => {
+    it("should validate correct patterns", () => {
+      expect(validatePermissionPattern("user.*.read")).toEqual({ valid: true });
+      expect(validatePermissionPattern("*")).toEqual({ valid: true });
+      expect(validatePermissionPattern("admin")).toEqual({ valid: true });
+      expect(validatePermissionPattern("a.b.c.d.e.f")).toEqual({ valid: true });
+    });
+
+    it("should reject invalid patterns", () => {
+      expect(validatePermissionPattern("")).toEqual({
+        valid: false,
+        error: "Permission pattern cannot be empty",
+      });
+      expect(validatePermissionPattern("   ")).toEqual({
+        valid: false,
+        error: "Permission pattern cannot be empty",
+      });
+      expect(validatePermissionPattern(null as any)).toEqual({
+        valid: false,
+        error: "Permission pattern must be a non-empty string",
+      });
+      expect(validatePermissionPattern(undefined as any)).toEqual({
+        valid: false,
+        error: "Permission pattern must be a non-empty string",
+      });
+      expect(validatePermissionPattern(123 as any)).toEqual({
+        valid: false,
+        error: "Permission pattern must be a non-empty string",
+      });
+    });
+
+    it("should trim whitespace before validation", () => {
+      expect(validatePermissionPattern("  user.*.read  ")).toEqual({ valid: true });
+      expect(validatePermissionPattern("  *  ")).toEqual({ valid: true });
+    });
   });
 });
