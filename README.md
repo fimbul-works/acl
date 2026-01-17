@@ -4,7 +4,7 @@ A functional, type-safe Access Control Layer (ACL) library for TypeScript/JavaSc
 
 [![npm version](https://badge.fury.io/js/%40fimbul-works%2Facl.svg)](https://www.npmjs.com/package/@fimbul-works/acl)
 [![TypeScript](https://badges.frapsoft.com/typescript/code/typescript.svg?v=101)](https://github.com/microsoft/TypeScript)
-[![Bundle Size](https://img.shields.io/bundlephobia/minzip/@fimbul-works/acl)](https://bundlephobia.com/package/@fimbul-works/aclV)
+[![Bundle Size](https://img.shields.io/bundlephobia/minzip/@fimbul-works/acl)](https://bundlephobia.com/package/@fimbul-works/acl)
 
 ## Features
 
